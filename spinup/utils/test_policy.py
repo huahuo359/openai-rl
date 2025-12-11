@@ -2,10 +2,11 @@ import time
 import joblib
 import os
 import os.path as osp
-import tensorflow as tf
 import torch
 from spinup import EpochLogger
 from spinup.utils.logx import restore_tf_graph
+import pyglet
+pyglet.options['shadow_window'] = False  # 避免 pyglet 创建隐藏窗口导致函数未定义
 
 
 def load_policy_and_env(fpath, itr='last', deterministic=False):

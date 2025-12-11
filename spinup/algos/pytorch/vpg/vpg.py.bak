@@ -1,10 +1,11 @@
 import numpy as np
-import tensorflow as tf
+import torch
+from torch.optim import Adam
 import gym
 import time
-import spinup.algos.tf1.vpg.core as core
+import spinup.algos.pytorch.vpg.core as core
 from spinup.utils.logx import EpochLogger
-from spinup.utils.mpi_tf import MpiAdamOptimizer, sync_all_params
+from spinup.utils.mpi_pytorch import setup_pytorch_for_mpi, sync_params, mpi_avg_grads
 from spinup.utils.mpi_tools import mpi_fork, mpi_avg, proc_id, mpi_statistics_scalar, num_procs
 
 
@@ -78,12 +79,13 @@ class VPGBuffer:
         # the next two lines implement the advantage normalization trick
         adv_mean, adv_std = mpi_statistics_scalar(self.adv_buf)
         self.adv_buf = (self.adv_buf - adv_mean) / adv_std
-        return [self.obs_buf, self.act_buf, self.adv_buf, 
-                self.ret_buf, self.logp_buf]
+        data = dict(obs=self.obs_buf, act=self.act_buf, ret=self.ret_buf,
+                    adv=self.adv_buf, logp=self.logp_buf)
+        return {k: torch.as_tensor(v, dtype=torch.float32) for k,v in data.items()}
 
 
 
-def vpg(env_fn, actor_critic=core.mlp_actor_critic, ac_kwargs=dict(), seed=0, 
+def vpg(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(),  seed=0, 
         steps_per_epoch=4000, epochs=50, gamma=0.99, pi_lr=3e-4,
         vf_lr=1e-3, train_v_iters=80, lam=0.97, max_ep_len=1000,
         logger_kwargs=dict(), save_freq=10):
@@ -96,28 +98,54 @@ def vpg(env_fn, actor_critic=core.mlp_actor_critic, ac_kwargs=dict(), seed=0,
         env_fn : A function which creates a copy of the environment.
             The environment must satisfy the OpenAI Gym API.
 
-        actor_critic: A function which takes in placeholder symbols 
-            for state, ``x_ph``, and action, ``a_ph``, and returns the main 
-            outputs from the agent's Tensorflow computation graph:
+        actor_critic: The constructor method for a PyTorch Module with a 
+            ``step`` method, an ``act`` method, a ``pi`` module, and a ``v`` 
+            module. The ``step`` method should accept a batch of observations 
+            and return:
 
             ===========  ================  ======================================
             Symbol       Shape             Description
             ===========  ================  ======================================
-            ``pi``       (batch, act_dim)  | Samples actions from policy given 
-                                           | states.
-            ``logp``     (batch,)          | Gives log probability, according to
-                                           | the policy, of taking actions ``a_ph``
-                                           | in states ``x_ph``.
-            ``logp_pi``  (batch,)          | Gives log probability, according to
-                                           | the policy, of the action sampled by
-                                           | ``pi``.
-            ``v``        (batch,)          | Gives the value estimate for states
-                                           | in ``x_ph``. (Critical: make sure 
-                                           | to flatten this!)
+            ``a``        (batch, act_dim)  | Numpy array of actions for each 
+                                           | observation.
+            ``v``        (batch,)          | Numpy array of value estimates
+                                           | for the provided observations.
+            ``logp_a``   (batch,)          | Numpy array of log probs for the
+                                           | actions in ``a``.
             ===========  ================  ======================================
 
-        ac_kwargs (dict): Any kwargs appropriate for the actor_critic 
-            function you provided to VPG.
+            The ``act`` method behaves the same as ``step`` but only returns ``a``.
+
+            The ``pi`` module's forward call should accept a batch of 
+            observations and optionally a batch of actions, and return:
+
+            ===========  ================  ======================================
+            Symbol       Shape             Description
+            ===========  ================  ======================================
+            ``pi``       N/A               | Torch Distribution object, containing
+                                           | a batch of distributions describing
+                                           | the policy for the provided observations.
+            ``logp_a``   (batch,)          | Optional (only returned if batch of
+                                           | actions is given). Tensor containing 
+                                           | the log probability, according to 
+                                           | the policy, of the provided actions.
+                                           | If actions not given, will contain
+                                           | ``None``.
+            ===========  ================  ======================================
+
+            The ``v`` module's forward call should accept a batch of observations
+            and return:
+
+            ===========  ================  ======================================
+            Symbol       Shape             Description
+            ===========  ================  ======================================
+            ``v``        (batch,)          | Tensor containing the value estimates
+                                           | for the provided observations. (Critical: 
+                                           | make sure to flatten this!)
+            ===========  ================  ======================================
+
+        ac_kwargs (dict): Any kwargs appropriate for the ActorCritic object 
+            you provided to VPG.
 
         seed (int): Seed for random number generators.
 
@@ -148,110 +176,132 @@ def vpg(env_fn, actor_critic=core.mlp_actor_critic, ac_kwargs=dict(), seed=0,
 
     """
 
+    # Special function to avoid certain slowdowns from PyTorch + MPI combo.
+    setup_pytorch_for_mpi()
+
+    # Set up logger and save configuration
     logger = EpochLogger(**logger_kwargs)
     logger.save_config(locals())
 
+    # Random seed
     seed += 10000 * proc_id()
-    tf.set_random_seed(seed)
+    torch.manual_seed(seed)
     np.random.seed(seed)
 
+    # Instantiate environment
     env = env_fn()
     obs_dim = env.observation_space.shape
     act_dim = env.action_space.shape
-    
-    # Share information about action space with policy architecture
-    ac_kwargs['action_space'] = env.action_space
 
-    # Inputs to computation graph
-    x_ph, a_ph = core.placeholders_from_spaces(env.observation_space, env.action_space)
-    adv_ph, ret_ph, logp_old_ph = core.placeholders(None, None, None)
+    # Create actor-critic module
+    ac = actor_critic(env.observation_space, env.action_space, **ac_kwargs)
 
-    # Main outputs from computation graph
-    pi, logp, logp_pi, v = actor_critic(x_ph, a_ph, **ac_kwargs)
+    # Sync params across processes
+    sync_params(ac)
 
-    # Need all placeholders in *this* order later (to zip with data from buffer)
-    all_phs = [x_ph, a_ph, adv_ph, ret_ph, logp_old_ph]
+    # Count variables
+    var_counts = tuple(core.count_vars(module) for module in [ac.pi, ac.v])
+    logger.log('\nNumber of parameters: \t pi: %d, \t v: %d\n'%var_counts)
 
-    # Every step, get: action, value, and logprob
-    get_action_ops = [pi, v, logp_pi]
-
-    # Experience buffer
+    # Set up experience buffer
     local_steps_per_epoch = int(steps_per_epoch / num_procs())
     buf = VPGBuffer(obs_dim, act_dim, local_steps_per_epoch, gamma, lam)
 
-    # Count variables
-    var_counts = tuple(core.count_vars(scope) for scope in ['pi', 'v'])
-    logger.log('\nNumber of parameters: \t pi: %d, \t v: %d\n'%var_counts)
+    # Set up function for computing VPG policy loss
+    def compute_loss_pi(data):
+        obs, act, adv, logp_old = data['obs'], data['act'], data['adv'], data['logp']
 
-    # VPG objectives
-    pi_loss = -tf.reduce_mean(logp * adv_ph)
-    v_loss = tf.reduce_mean((ret_ph - v)**2)
+        # Policy loss
+        pi, logp = ac.pi(obs, act)
+        loss_pi = -(logp * adv).mean()
 
-    # Info (useful to watch during learning)
-    approx_kl = tf.reduce_mean(logp_old_ph - logp)      # a sample estimate for KL-divergence, easy to compute
-    approx_ent = tf.reduce_mean(-logp)                  # a sample estimate for entropy, also easy to compute
+        # Useful extra info
+        approx_kl = (logp_old - logp).mean().item()
+        ent = pi.entropy().mean().item()
+        pi_info = dict(kl=approx_kl, ent=ent)
 
-    # Optimizers
-    train_pi = MpiAdamOptimizer(learning_rate=pi_lr).minimize(pi_loss)
-    train_v = MpiAdamOptimizer(learning_rate=vf_lr).minimize(v_loss)
+        return loss_pi, pi_info
 
-    sess = tf.Session()
-    sess.run(tf.global_variables_initializer())
+    # Set up function for computing value loss
+    def compute_loss_v(data):
+        obs, ret = data['obs'], data['ret']
+        return ((ac.v(obs) - ret)**2).mean()
 
-    # Sync params across processes
-    sess.run(sync_all_params())
+    # Set up optimizers for policy and value function
+    pi_optimizer = Adam(ac.pi.parameters(), lr=pi_lr)
+    vf_optimizer = Adam(ac.v.parameters(), lr=vf_lr)
 
-    # Setup model saving
-    logger.setup_tf_saver(sess, inputs={'x': x_ph}, outputs={'pi': pi, 'v': v})
+    # Set up model saving
+    logger.setup_pytorch_saver(ac)
 
     def update():
-        inputs = {k:v for k,v in zip(all_phs, buf.get())}
-        pi_l_old, v_l_old, ent = sess.run([pi_loss, v_loss, approx_ent], feed_dict=inputs)
+        data = buf.get()
 
-        # Policy gradient step
-        sess.run(train_pi, feed_dict=inputs)
+        # Get loss and info values before update
+        pi_l_old, pi_info_old = compute_loss_pi(data)
+        pi_l_old = pi_l_old.item()
+        v_l_old = compute_loss_v(data).item()
+
+        # Train policy with a single step of gradient descent
+        pi_optimizer.zero_grad()
+        loss_pi, pi_info = compute_loss_pi(data)
+        loss_pi.backward()
+        mpi_avg_grads(ac.pi)    # average grads across MPI processes
+        pi_optimizer.step()
 
         # Value function learning
-        for _ in range(train_v_iters):
-            sess.run(train_v, feed_dict=inputs)
+        for i in range(train_v_iters):
+            vf_optimizer.zero_grad()
+            loss_v = compute_loss_v(data)
+            loss_v.backward()
+            mpi_avg_grads(ac.v)    # average grads across MPI processes
+            vf_optimizer.step()
 
         # Log changes from update
-        pi_l_new, v_l_new, kl = sess.run([pi_loss, v_loss, approx_kl], feed_dict=inputs)
-        logger.store(LossPi=pi_l_old, LossV=v_l_old, 
-                     KL=kl, Entropy=ent, 
-                     DeltaLossPi=(pi_l_new - pi_l_old),
-                     DeltaLossV=(v_l_new - v_l_old))
+        kl, ent = pi_info['kl'], pi_info_old['ent']
+        logger.store(LossPi=pi_l_old, LossV=v_l_old,
+                     KL=kl, Entropy=ent,
+                     DeltaLossPi=(loss_pi.item() - pi_l_old),
+                     DeltaLossV=(loss_v.item() - v_l_old))
 
+    # Prepare for interaction with environment
     start_time = time.time()
     o, ep_ret, ep_len = env.reset(), 0, 0
 
     # Main loop: collect experience in env and update/log each epoch
     for epoch in range(epochs):
         for t in range(local_steps_per_epoch):
-            a, v_t, logp_t = sess.run(get_action_ops, feed_dict={x_ph: o.reshape(1,-1)})
+            a, v, logp = ac.step(torch.as_tensor(o, dtype=torch.float32))
 
-            o2, r, d, _ = env.step(a[0])
+            next_o, r, d, _ = env.step(a)
             ep_ret += r
             ep_len += 1
 
             # save and log
-            buf.store(o, a, r, v_t, logp_t)
-            logger.store(VVals=v_t)
-
+            buf.store(o, a, r, v, logp)
+            logger.store(VVals=v)
+            
             # Update obs (critical!)
-            o = o2
+            o = next_o
 
-            terminal = d or (ep_len == max_ep_len)
-            if terminal or (t==local_steps_per_epoch-1):
-                if not(terminal):
-                    print('Warning: trajectory cut off by epoch at %d steps.'%ep_len)
+            timeout = ep_len == max_ep_len
+            terminal = d or timeout
+            epoch_ended = t==local_steps_per_epoch-1
+
+            if terminal or epoch_ended:
+                if epoch_ended and not(terminal):
+                    print('Warning: trajectory cut off by epoch at %d steps.'%ep_len, flush=True)
                 # if trajectory didn't reach terminal state, bootstrap value target
-                last_val = 0 if d else sess.run(v, feed_dict={x_ph: o.reshape(1,-1)})
-                buf.finish_path(last_val)
+                if timeout or epoch_ended:
+                    _, v, _ = ac.step(torch.as_tensor(o, dtype=torch.float32))
+                else:
+                    v = 0
+                buf.finish_path(v)
                 if terminal:
                     # only save EpRet / EpLen if trajectory finished
                     logger.store(EpRet=ep_ret, EpLen=ep_len)
                 o, ep_ret, ep_len = env.reset(), 0, 0
+
 
         # Save model
         if (epoch % save_freq == 0) or (epoch == epochs-1):
@@ -294,7 +344,7 @@ if __name__ == '__main__':
     from spinup.utils.run_utils import setup_logger_kwargs
     logger_kwargs = setup_logger_kwargs(args.exp_name, args.seed)
 
-    vpg(lambda : gym.make(args.env), actor_critic=core.mlp_actor_critic,
+    vpg(lambda : gym.make(args.env), actor_critic=core.MLPActorCritic,
         ac_kwargs=dict(hidden_sizes=[args.hid]*args.l), gamma=args.gamma, 
         seed=args.seed, steps_per_epoch=args.steps, epochs=args.epochs,
         logger_kwargs=logger_kwargs)
